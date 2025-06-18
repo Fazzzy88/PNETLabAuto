@@ -1,0 +1,216 @@
+import re
+import time
+from ipaddress import ip_interface, ip_network
+import pandas as pd
+from netmiko import ConnectHandler
+
+
+def get_running_config(
+        host: str = "192.168.4.4",
+        router: str = "",
+        port: int = 0,
+        username: str = "",
+        password: str = "",  # По умолчанию пусто
+        enable_password: str = "\n",  # Enter для enable (можно изменить)
+        save_to_file: bool = True,  # Сохранять ли конфиг в файл?
+        verbose: bool = True  # Выводить логи в консоль?
+):
+    global connection
+    device = {
+        "device_type": "cisco_ios_telnet",  # Важно: указываем Telnet!
+        "host": host,  # Адрес PNET Lab
+        "port": port,  # Telnet-порт устройства (например, R1)
+        "secret": enable_password,  # Пароль enable (если есть)
+        "global_delay_factor": 2  # Замедление для старых эмуляторов
+    }
+
+    try:
+        # 1. Подключение
+        print("🔌 Подключаюсь к устройству...")
+        connection = ConnectHandler(**device)
+
+        # 2. Отправляем "\n" (если устройство "спит")
+        connection.write_channel("\n")
+        time.sleep(1)
+
+        # 3. Проверяем, есть ли enable-режим
+        if device["secret"]:
+            connection.enable()
+
+        # 4. Проверяем текущий режим (возможно, уже в config mode)
+        prompt = connection.find_prompt()
+        if "(config)" in prompt:
+            print("⚠️ Устройство уже в режиме configure terminal!")
+        else:
+            print("⌛ Переход в 'configure terminal'...")
+            connection.config_mode()  # Пытаемся войти в conf t
+
+        # 5. Выполняем "do show running-config"
+        print("🔍 Выполняю 'do show running-config'...")
+        output = connection.send_command("do show running-config", delay_factor=2)
+
+        # 6. Сохраняем конфигурацию
+        with open(f"{router}_running_config.txt", "w") as f:
+            f.write(output)
+        print(f"✅ Конфигурация сохранена в {router}_running_config.txt")
+
+        # 7. Выходим из config mode (если были внутри)
+        if "(config)" in connection.find_prompt():
+            connection.exit_config_mode()
+
+    except Exception as e:
+        print(f"🚨 Ошибка: {e}")
+
+    finally:
+        if "connection" in locals():
+            connection.disconnect()
+            print("🔒 Сессия закрыта.")
+
+
+def check_router_config(router: str, config: str) -> dict:
+    """
+    Проверяет конфигурацию роутера согласно топологии
+    Возвращает словарь с результатами проверки интерфейсов
+    """
+    results = {}
+
+    # Строгие проверки для конкретных интерфейсов
+    strict_checks = {
+        "R1": {"Ethernet0/0": "173.14.203.1/24"},
+        "R3": {"Ethernet0/0": "173.14.201.1/24"},
+        "R4": {"Ethernet0/2": "173.14.202.1/24"}
+    }
+
+    # Проверка строгих требований
+    if router in strict_checks:
+        for interface, expected_ip in strict_checks[router].items():
+            results[interface] = check_exact_ip(config, interface, expected_ip)
+
+    # Проверка остальных интерфейсов согласно топологии
+    if router == "R1":
+        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.12/30")
+
+    elif router == "R2":
+        results["Ethernet0/0"] = check_ip_in_subnet(config, "Ethernet0/0", "197.148.231.0/30")
+        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.12/30")
+        results["Ethernet0/2"] = check_ip_in_subnet(config, "Ethernet0/2", "197.148.231.4/30")
+
+    elif router == "R3":
+        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.8/30")
+        results["Ethernet0/2"] = check_ip_in_subnet(config, "Ethernet0/2", "197.148.231.0/30")
+
+    elif router == "R4":
+        results["Ethernet0/0"] = check_ip_in_subnet(config, "Ethernet0/0", "197.148.231.8/30")
+        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.4/30")
+
+    return results
+
+
+def check_exact_ip(config: str, interface: str, expected_ip: str) -> bool:
+    """
+    Проверяет точное соответствие IP на интерфейсе и его статус (shutdown)
+    """
+    expected = ip_interface(expected_ip)
+    # Ищем блок конфигурации интерфейса
+    pattern = rf"interface {interface}.*?(?=^interface|\Z)"
+    match = re.search(pattern, config, re.DOTALL | re.MULTILINE)
+    if not match:
+        return False
+
+    interface_block = match.group(0)
+    # Проверяем наличие shutdown в блоке интерфейса
+    if re.search(r"^\s+shutdown\b", interface_block, re.MULTILINE):
+        return False
+
+    # Проверяем точный IP-адрес
+    ip_pattern = rf"ip address {expected.ip}\s+{expected.netmask}"
+    return bool(re.search(ip_pattern, interface_block))
+
+
+def check_ip_in_subnet(config: str, interface: str, subnet: str) -> bool:
+    """
+    Проверяет, что на интерфейсе есть любой IP из указанной подсети и интерфейс не выключен
+    """
+    network = ip_network(subnet, strict=False)
+    # Ищем блок конфигурации интерфейса
+    pattern = rf"interface {interface}.*?(?=^interface|\Z)"
+    match = re.search(pattern, config, re.DOTALL | re.MULTILINE)
+    if not match:
+        return False
+
+    interface_block = match.group(0)
+    # Проверяем наличие shutdown в блоке интерфейса
+    if re.search(r"^\s+shutdown\b", interface_block, re.MULTILINE):
+        return False
+
+    # Ищем IP-адрес в блоке интерфейса
+    ip_pattern = r"ip address (\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)"
+    ip_match = re.search(ip_pattern, interface_block)
+    if not ip_match:
+        return False
+
+    ip = ip_match.group(1)
+    mask = ip_match.group(2)
+
+    try:
+        interface_ip = ip_interface(f"{ip}/{mask}")
+        return interface_ip.network == network
+    except ValueError:
+        return False
+
+
+def check_static_addresses(config: str) -> bool:
+    """
+    Проверяет, что нет DHCP на интерфейсах
+    """
+    return "ip address dhcp" not in config
+
+
+def parse_pnet_ports(file_path: str) -> dict:
+    """
+    Получает порты роутеров R1-R4 из файла PNET Lab
+    Возвращает словарь вида {'R1': 30812, 'R2': 30813, ...}
+    """
+    try:
+        # Читаем HTML-таблицу
+        df = pd.read_html(file_path)[0]
+
+        # Фильтруем только R1-R4 и создаем словарь
+        routers = df[df['Node Name'].isin(['R1', 'R2', 'R3', 'R4'])]
+        return dict(zip(routers['Node Name'], routers['Port']))
+
+    except Exception as e:
+        print(f"Ошибка: {e}")
+        return {}
+
+
+if __name__ == '__main__':
+    try:
+        # 1. Получаем порты
+        ports = parse_pnet_ports("node_sessions.xls")
+        print("✅ Найдены порты:", ports)
+
+        # 2. Пример использования с get_running_config
+        for router, port in ports.items():
+            print(f"\n🔧 Получаю конфигурацию {router} (порт {port})...")
+            config = get_running_config(port=port, router=router)
+            print(config)
+    except ValueError as e:
+        print(f"🚨 Ошибка: {e}")
+    except Exception as e:
+        print(f"⚠️ Неожиданная ошибка: {e}")
+
+    print("Задание 1. Настроить IP адреса маршрутизаторов")
+
+    for router in ["R1", "R2", "R3", "R4"]:
+        try:
+            with open(f"{router}_running_config.txt", "r") as f:
+                config = f.read()
+
+            checks = check_router_config(router, config)
+            print(f"\n{router} проверка:")
+            for interface, status in checks.items():
+                print(f"{interface}: {'✅' if status else '❌'}")
+
+        except FileNotFoundError:
+            print(f"⚠️ Файл конфигурации {router} не найден")
