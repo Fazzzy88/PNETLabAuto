@@ -3,7 +3,7 @@ import time
 from ipaddress import ip_interface, ip_network
 import pandas as pd
 from netmiko import ConnectHandler
-
+import telnetlib
 
 def get_running_config(
         host: str = "192.168.4.4",
@@ -196,6 +196,33 @@ def check_server_config(config: str) -> bool:
     ip_pattern = rf"ip address {expected.ip}\s+{expected.netmask}"
     return bool(re.search(ip_pattern, block))
 
+def check_vpc_dhcp(host: str, port: int, expected_subnet: str) -> bool:
+    try:
+        with telnetlib.Telnet(host, port, timeout=5) as tn:
+            time.sleep(1)
+            tn.write(b"\n")
+            time.sleep(1)
+            tn.write(b"ip dhcp\n")
+            time.sleep(10)
+            output = tn.read_very_eager().decode(errors="ignore")
+            print(output)
+
+        # Проверка: есть ли DORA / DDORA / DDDORA
+        if not re.search(r"D+ORA", output):
+            return False
+
+        # Поиск IP
+        match = re.search(r"IP\s+(\d+\.\d+\.\d+\.\d+)/\d+", output)
+        if not match:
+            return False
+
+        ip = match.group(1)
+        return ip_interface(f"{ip}/24").ip in ip_network(expected_subnet)
+
+    except Exception as e:
+        print(f"🚨 Ошибка подключения к VPC ({port}): {e}")
+        return False
+
 
 if __name__ == '__main__':
     try:
@@ -243,3 +270,19 @@ if __name__ == '__main__':
             print("⚠️ Файл конфигурации SRV не найден")
     else:
         print("⚠️ Узел SRV не найден в node_sessions.xls")
+
+    print("\nЗадание 3. Проверка получения IP по DHCP на VPC-хостах")
+
+    vpc_targets = {
+        "VPC-Samara": "173.14.201.0/24",
+        "VPC-Izhevsk": "173.14.202.0/24",
+        "VPC-Kazan": "173.14.203.0/24"
+    }
+
+    for vpc_name, subnet in vpc_targets.items():
+        if vpc_name in ports:
+            print(f"\n🔄 Проверяю {vpc_name}...")
+            success = check_vpc_dhcp("192.168.4.4", ports[vpc_name], subnet)
+            print(f"{vpc_name}: {'✅ Получен IP из нужной подсети' if success else '❌ Ошибка DHCP или неверный IP'}")
+        else:
+            print(f"{vpc_name}: ⚠️ Порт не найден в node_sessions.xls")
