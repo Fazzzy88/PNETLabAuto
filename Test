@@ -168,20 +168,33 @@ def check_static_addresses(config: str) -> bool:
 
 def parse_pnet_ports(file_path: str) -> dict:
     """
-    Получает порты роутеров R1-R4 из файла PNET Lab
-    Возвращает словарь вида {'R1': 30812, 'R2': 30813, ...}
+    Получает порты всех узлов из файла PNET Lab
+    Возвращает словарь вида {'R1': 30812, 'R2': 30813, ..., 'SRV': 30820}
     """
     try:
-        # Читаем HTML-таблицу
         df = pd.read_html(file_path)[0]
-
-        # Фильтруем только R1-R4 и создаем словарь
-        routers = df[df['Node Name'].isin(['R1', 'R2', 'R3', 'R4'])]
-        return dict(zip(routers['Node Name'], routers['Port']))
-
+        df = df[df['Node Name'].notna()]
+        return dict(zip(df['Node Name'], df['Port']))
     except Exception as e:
         print(f"Ошибка: {e}")
         return {}
+
+def check_server_config(config: str) -> bool:
+    """
+    Проверяет, что интерфейс e0/0 на сервере SRV включен и имеет IP 173.14.231.100/24
+    """
+    expected = ip_interface("173.14.201.100/24")
+    pattern = rf"interface Ethernet0/0.*?(?=^interface|\Z)"
+    match = re.search(pattern, config, re.DOTALL | re.MULTILINE)
+    if not match:
+        return False
+
+    block = match.group(0)
+    if re.search(r"^\s+shutdown\b", block, re.MULTILINE):
+        return False
+
+    ip_pattern = rf"ip address {expected.ip}\s+{expected.netmask}"
+    return bool(re.search(ip_pattern, block))
 
 
 if __name__ == '__main__':
@@ -214,3 +227,19 @@ if __name__ == '__main__':
 
         except FileNotFoundError:
             print(f"⚠️ Файл конфигурации {router} не найден")
+
+    print("\nЗадание 2. Настроить адрес сервера")
+
+    if "SRV" in ports:
+        try:
+            with open("SRV_running_config.txt", "r") as f:
+                srv_config = f.read()
+
+            if check_server_config(srv_config):
+                print("SRV: ✅ Адрес настроен правильно")
+            else:
+                print("SRV: ❌ Ошибка в настройке интерфейса Ethernet0/0")
+        except FileNotFoundError:
+            print("⚠️ Файл конфигурации SRV не найден")
+    else:
+        print("⚠️ Узел SRV не найден в node_sessions.xls")
