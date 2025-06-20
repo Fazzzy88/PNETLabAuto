@@ -223,6 +223,87 @@ def check_vpc_dhcp(host: str, port: int, expected_subnet: str) -> bool:
         print(f"🚨 Ошибка подключения к VPC ({port}): {e}")
         return False
 
+def get_vpc_ip(host: str, port: int) -> str:
+    """Получает текущий IP адрес VPC через show ip all"""
+    try:
+        with telnetlib.Telnet(host, port, timeout=5) as tn:
+            time.sleep(1)
+            tn.write(b"\n")
+            time.sleep(1)
+            tn.write(b"show ip all\n")
+            time.sleep(2)
+            output = tn.read_very_eager().decode(errors="ignore")
+            match = re.search(r"IP/MASK\s+([0-9.]+)", output)
+            if match:
+                return match.group(1)
+    except Exception as e:
+        print(f"❌ Ошибка при получении IP VPC ({port}): {e}")
+    return None
+
+
+def ping_vpc(host: str, port: int, target_ip: str) -> bool:
+    """Пингует другой IP адрес из VPC"""
+    try:
+        with telnetlib.Telnet(host, port, timeout=5) as tn:
+            time.sleep(1)
+            tn.write(b"\n")
+            time.sleep(1)
+            command = f"ping {target_ip}\n".encode()
+            tn.write(command)
+            time.sleep(4)
+            output = tn.read_very_eager().decode(errors="ignore")
+            return "ttl=" in output.lower() or "icmp_seq=" in output.lower()
+    except Exception as e:
+        print(f"❌ Ошибка пинга с VPC ({port}): {e}")
+    return False
+
+
+def extract_ip_from_show_ip(output: str) -> str:
+    """
+    Парсит вывод show ip all и извлекает IP-адрес
+    """
+    match = re.search(r"\bIP/MASK\s+GATEWAY.*\n.*?(\d+\.\d+\.\d+\.\d+)/\d+", output)
+    if match:
+        return match.group(1)
+    else:
+        raise ValueError("❌ Не удалось найти IP в выводе команды show ip all")
+
+def ping_test(host: str, port: int, targets: list[str]) -> dict:
+    """
+    Выполняет пинг с VPC-хоста до списка IP-адресов
+    Возвращает словарь с результатами по каждому IP
+    """
+    results = {}
+    try:
+        with telnetlib.Telnet(host, port, timeout=5) as tn:
+            time.sleep(1)
+            tn.write(b"\n")
+            time.sleep(1)
+            tn.write(b"show ip all\n")
+            time.sleep(1)
+            output = tn.read_very_eager().decode(errors="ignore")
+            print(f"🔎 Вывод show ip all:\n{output}")
+            my_ip = extract_ip_from_show_ip(output)
+            print(f"🧠 Мой IP: {my_ip}")
+
+            for target_ip in targets:
+                tn.write(f"ping {target_ip}\n".encode())
+                time.sleep(5)
+                ping_output = tn.read_very_eager().decode(errors="ignore")
+                print(f"📡 Пинг {target_ip}:\n{ping_output}")
+                if ("unreachable" in ping_output.lower() or
+                    "timeout" in ping_output.lower()):
+                    results[target_ip] = False
+                else:
+                    results[target_ip] = True
+    except Exception as e:
+        print(f"🚨 Ошибка при пинге с порта {port}: {e}")
+        for ip in targets:
+            results[ip] = False
+    return results
+
+
+
 
 if __name__ == '__main__':
     try:
@@ -286,3 +367,40 @@ if __name__ == '__main__':
             print(f"{vpc_name}: {'✅ Получен IP из нужной подсети' if success else '❌ Ошибка DHCP или неверный IP'}")
         else:
             print(f"{vpc_name}: ⚠️ Порт не найден в node_sessions.xls")
+
+    print("\nЗадание 4. Проверка пингов между VPC")
+
+    ip_map = {}
+    host = '192.168.4.4'
+    for vpc in ["VPC-Izhevsk", "VPC-Kazan", "VPC-Samara"]:
+        if vpc in ports:
+            try:
+                with telnetlib.Telnet(host, ports[vpc], timeout=5) as tn:
+                    tn.write(b"\n")
+                    time.sleep(1)
+                    tn.write(b"show ip all\n")
+                    time.sleep(1)
+                    output = tn.read_very_eager().decode(errors="ignore")
+                    ip_map[vpc] = extract_ip_from_show_ip(output)
+            except Exception as e:
+                print(f"⚠️ Не удалось получить IP для {vpc}: {e}")
+                ip_map[vpc] = None
+
+    # Проверка с VPC-Samara
+    if ports.get("VPC-Samara"):
+        print("\n✅ Проверка с VPC-Samara:")
+        result = ping_test(host, ports["VPC-Samara"], [
+            ip_map.get("VPC-Izhevsk"),
+            ip_map.get("VPC-Kazan")
+        ])
+        for target, status in result.items():
+            print(f"Пинг до {target}: {'✅ Успешно' if status else '❌ Ошибка'}")
+
+    # Проверка с VPC-Izhevsk
+    if ports.get("VPC-Izhevsk"):
+        print("\n✅ Проверка с VPC-Izhevsk:")
+        result = ping_test(host, ports["VPC-Izhevsk"], [
+            ip_map.get("VPC-Kazan")
+        ])
+        for target, status in result.items():
+            print(f"Пинг до {target}: {'✅ Успешно' if status else '❌ Ошибка'}")
