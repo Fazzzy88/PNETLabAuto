@@ -5,304 +5,152 @@ import pandas as pd
 from netmiko import ConnectHandler
 import telnetlib
 
-def get_running_config(
-        host: str = "192.168.4.4",
-        router: str = "",
-        port: int = 0,
-        username: str = "",
-        password: str = "",  # По умолчанию пусто
-        enable_password: str = "\n",  # Enter для enable (можно изменить)
-        save_to_file: bool = True,  # Сохранять ли конфиг в файл?
-        verbose: bool = True  # Выводить логи в консоль?
-):
-    global connection
-    device = {
-        "device_type": "cisco_ios_telnet",  # Важно: указываем Telnet!
-        "host": host,  # Адрес PNET Lab
-        "port": port,  # Telnet-порт устройства (например, R1)
-        "secret": enable_password,  # Пароль enable (если есть)
-        "global_delay_factor": 2  # Замедление для старых эмуляторов
-    }
+# --- Утилиты ---
 
-    try:
-        # 1. Подключение
-        print("🔌 Подключаюсь к устройству...")
-        connection = ConnectHandler(**device)
+def get_interface_block(config: str, interface: str) -> str:
+    match = re.search(rf"interface {interface}.*?(?=^interface|\Z)", config, re.DOTALL | re.MULTILINE)
+    return match.group(0) if match else ""
 
-        # 2. Отправляем "\n" (если устройство "спит")
-        connection.write_channel("\n")
-        time.sleep(1)
+def is_interface_active(block: str) -> bool:
+    return not re.search(r"^\s+shutdown\b", block, re.MULTILINE)
 
-        # 3. Проверяем, есть ли enable-режим
-        if device["secret"]:
-            connection.enable()
-
-        # 4. Проверяем текущий режим (возможно, уже в config mode)
-        prompt = connection.find_prompt()
-        if "(config)" in prompt:
-            print("⚠️ Устройство уже в режиме configure terminal!")
-        else:
-            print("⌛ Переход в 'configure terminal'...")
-            connection.config_mode()  # Пытаемся войти в conf t
-
-        # 5. Выполняем "do show running-config"
-        print("🔍 Выполняю 'do show running-config'...")
-        output = connection.send_command("do show running-config", delay_factor=2)
-
-        # 6. Сохраняем конфигурацию
-        with open(f"{router}_running_config.txt", "w") as f:
-            f.write(output)
-        print(f"✅ Конфигурация сохранена в {router}_running_config.txt")
-
-        # 7. Выходим из config mode (если были внутри)
-        if "(config)" in connection.find_prompt():
-            connection.exit_config_mode()
-
-    except Exception as e:
-        print(f"🚨 Ошибка: {e}")
-
-    finally:
-        if "connection" in locals():
-            connection.disconnect()
-            print("🔒 Сессия закрыта.")
-
-
-def check_router_config(router: str, config: str) -> dict:
-    """
-    Проверяет конфигурацию роутера согласно топологии
-    Возвращает словарь с результатами проверки интерфейсов
-    """
-    results = {}
-
-    # Строгие проверки для конкретных интерфейсов
-    strict_checks = {
-        "R1": {"Ethernet0/0": "173.14.203.1/24"},
-        "R3": {"Ethernet0/0": "173.14.201.1/24"},
-        "R4": {"Ethernet0/2": "173.14.202.1/24"}
-    }
-
-    # Проверка строгих требований
-    if router in strict_checks:
-        for interface, expected_ip in strict_checks[router].items():
-            results[interface] = check_exact_ip(config, interface, expected_ip)
-
-    # Проверка остальных интерфейсов согласно топологии
-    if router == "R1":
-        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.12/30")
-
-    elif router == "R2":
-        results["Ethernet0/0"] = check_ip_in_subnet(config, "Ethernet0/0", "197.148.231.0/30")
-        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.12/30")
-        results["Ethernet0/2"] = check_ip_in_subnet(config, "Ethernet0/2", "197.148.231.4/30")
-
-    elif router == "R3":
-        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.8/30")
-        results["Ethernet0/2"] = check_ip_in_subnet(config, "Ethernet0/2", "197.148.231.0/30")
-
-    elif router == "R4":
-        results["Ethernet0/0"] = check_ip_in_subnet(config, "Ethernet0/0", "197.148.231.8/30")
-        results["Ethernet0/1"] = check_ip_in_subnet(config, "Ethernet0/1", "197.148.231.4/30")
-
-    return results
-
-
-def check_exact_ip(config: str, interface: str, expected_ip: str) -> bool:
-    """
-    Проверяет точное соответствие IP на интерфейсе и его статус (shutdown)
-    """
+def match_ip_in_block(block: str, expected_ip: str) -> bool:
     expected = ip_interface(expected_ip)
-    # Ищем блок конфигурации интерфейса
-    pattern = rf"interface {interface}.*?(?=^interface|\Z)"
-    match = re.search(pattern, config, re.DOTALL | re.MULTILINE)
-    if not match:
-        return False
-
-    interface_block = match.group(0)
-    # Проверяем наличие shutdown в блоке интерфейса
-    if re.search(r"^\s+shutdown\b", interface_block, re.MULTILINE):
-        return False
-
-    # Проверяем точный IP-адрес
     ip_pattern = rf"ip address {expected.ip}\s+{expected.netmask}"
-    return bool(re.search(ip_pattern, interface_block))
+    return re.search(ip_pattern, block) is not None
 
-
-def check_ip_in_subnet(config: str, interface: str, subnet: str) -> bool:
-    """
-    Проверяет, что на интерфейсе есть любой IP из указанной подсети и интерфейс не выключен
-    """
-    network = ip_network(subnet, strict=False)
-    # Ищем блок конфигурации интерфейса
-    pattern = rf"interface {interface}.*?(?=^interface|\Z)"
-    match = re.search(pattern, config, re.DOTALL | re.MULTILINE)
+def ip_in_subnet(block: str, subnet: str) -> bool:
+    net = ip_network(subnet, strict=False)
+    match = re.search(r"ip address (\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)", block)
     if not match:
         return False
-
-    interface_block = match.group(0)
-    # Проверяем наличие shutdown в блоке интерфейса
-    if re.search(r"^\s+shutdown\b", interface_block, re.MULTILINE):
-        return False
-
-    # Ищем IP-адрес в блоке интерфейса
-    ip_pattern = r"ip address (\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)"
-    ip_match = re.search(ip_pattern, interface_block)
-    if not ip_match:
-        return False
-
-    ip = ip_match.group(1)
-    mask = ip_match.group(2)
-
     try:
-        interface_ip = ip_interface(f"{ip}/{mask}")
-        return interface_ip.network == network
+        return ip_interface(f"{match.group(1)}/{match.group(2)}").network == net
     except ValueError:
         return False
 
+# --- Основные проверки ---
 
-def check_static_addresses(config: str) -> bool:
-    """
-    Проверяет, что нет DHCP на интерфейсах
-    """
-    return "ip address dhcp" not in config
+def check_exact_ip(config, interface, expected_ip):
+    block = get_interface_block(config, interface)
+    return block and is_interface_active(block) and match_ip_in_block(block, expected_ip)
 
+def check_ip_in_subnet(config, interface, subnet):
+    block = get_interface_block(config, interface)
+    return block and is_interface_active(block) and ip_in_subnet(block, subnet)
 
-def parse_pnet_ports(file_path: str) -> dict:
-    """
-    Получает порты всех узлов из файла PNET Lab
-    Возвращает словарь вида {'R1': 30812, 'R2': 30813, ..., 'SRV': 30820}
-    """
-    try:
-        df = pd.read_html(file_path)[0]
-        df = df[df['Node Name'].notna()]
-        return dict(zip(df['Node Name'], df['Port']))
-    except Exception as e:
-        print(f"Ошибка: {e}")
-        return {}
+def check_router_config(router: str, config: str) -> dict:
+    checks = {
+        "R1": {"Ethernet0/0": "173.14.203.1/24", "Ethernet0/1": "197.148.231.12/30"},
+        "R2": {
+            "Ethernet0/0": "197.148.231.0/30",
+            "Ethernet0/1": "197.148.231.12/30",
+            "Ethernet0/2": "197.148.231.4/30",
+        },
+        "R3": {
+            "Ethernet0/0": "173.14.201.1/24",
+            "Ethernet0/1": "197.148.231.8/30",
+            "Ethernet0/2": "197.148.231.0/30",
+        },
+        "R4": {
+            "Ethernet0/2": "173.14.202.1/24",
+            "Ethernet0/0": "197.148.231.8/30",
+            "Ethernet0/1": "197.148.231.4/30",
+        },
+    }
+    results = {}
+    for intf, addr in checks.get(router, {}).items():
+        if "/24" in addr:
+            results[intf] = check_exact_ip(config, intf, addr)
+        else:
+            results[intf] = check_ip_in_subnet(config, intf, addr)
+    return results
 
 def check_server_config(config: str) -> bool:
-    """
-    Проверяет, что интерфейс e0/0 на сервере SRV включен и имеет IP 173.14.231.100/24
-    """
-    expected = ip_interface("173.14.201.100/24")
-    pattern = rf"interface Ethernet0/0.*?(?=^interface|\Z)"
-    match = re.search(pattern, config, re.DOTALL | re.MULTILINE)
-    if not match:
-        return False
+    block = get_interface_block(config, "Ethernet0/0")
+    return block and is_interface_active(block) and match_ip_in_block(block, "173.14.201.100/24")
 
-    block = match.group(0)
-    if re.search(r"^\s+shutdown\b", block, re.MULTILINE):
-        return False
+def check_static_addresses(config: str) -> bool:
+    return "ip address dhcp" not in config
 
-    ip_pattern = rf"ip address {expected.ip}\s+{expected.netmask}"
-    return bool(re.search(ip_pattern, block))
+def get_running_config(host="192.168.4.4", port=0, router="", enable_password="\n"):
+    device = {
+        "device_type": "cisco_ios_telnet",
+        "host": host,
+        "port": port,
+        "secret": enable_password,
+        "global_delay_factor": 2
+    }
+    try:
+        print(f"🔌 Подключение к {router}...")
+        conn = ConnectHandler(**device)
+        conn.write_channel("\n")
+        time.sleep(1)
+        if device["secret"]:
+            conn.enable()
+        if "(config)" not in conn.find_prompt():
+            conn.config_mode()
+        output = conn.send_command("do show running-config", delay_factor=2)
+        with open(f"{router}_running_config.txt", "w") as f:
+            f.write(output)
+        print(f"✅ Сохранено: {router}_running_config.txt")
+        conn.disconnect()
+        return output
+    except Exception as e:
+        print(f"🚨 Ошибка {router}: {e}")
+
+# --- Работа с VPC ---
+
+def parse_pnet_ports(file_path: str) -> dict:
+    try:
+        df = pd.read_html(file_path)[0]
+        return dict(zip(df['Node Name'], df['Port']))
+    except Exception as e:
+        print(f"Ошибка чтения XLS: {e}")
+        return {}
 
 def check_vpc_dhcp(host: str, port: int, expected_subnet: str) -> bool:
     try:
         with telnetlib.Telnet(host, port, timeout=5) as tn:
-            time.sleep(1)
-            tn.write(b"\n")
-            time.sleep(1)
-            tn.write(b"ip dhcp\n")
-            time.sleep(10)
+            tn.write(b"\n"); time.sleep(1)
+            tn.write(b"ip dhcp\n"); time.sleep(8)
             output = tn.read_very_eager().decode(errors="ignore")
-            print(output)
-
-        # Проверка: есть ли DORA / DDORA / DDDORA
         if not re.search(r"D+ORA", output):
             return False
-
-        # Поиск IP
         match = re.search(r"IP\s+(\d+\.\d+\.\d+\.\d+)/\d+", output)
         if not match:
             return False
-
-        ip = match.group(1)
-        return ip_interface(f"{ip}/24").ip in ip_network(expected_subnet)
-
+        return ip_interface(f"{match.group(1)}/24").ip in ip_network(expected_subnet)
     except Exception as e:
-        print(f"🚨 Ошибка подключения к VPC ({port}): {e}")
+        print(f"❌ DHCP ошибка на порту {port}: {e}")
         return False
 
-def get_vpc_ip(host: str, port: int) -> str:
-    """Получает текущий IP адрес VPC через show ip all"""
-    try:
-        with telnetlib.Telnet(host, port, timeout=5) as tn:
-            time.sleep(1)
-            tn.write(b"\n")
-            time.sleep(1)
-            tn.write(b"show ip all\n")
-            time.sleep(2)
-            output = tn.read_very_eager().decode(errors="ignore")
-            match = re.search(r"IP/MASK\s+([0-9.]+)", output)
-            if match:
-                return match.group(1)
-    except Exception as e:
-        print(f"❌ Ошибка при получении IP VPC ({port}): {e}")
-    return None
-
-
-def ping_vpc(host: str, port: int, target_ip: str) -> bool:
-    """Пингует другой IP адрес из VPC"""
-    try:
-        with telnetlib.Telnet(host, port, timeout=5) as tn:
-            time.sleep(1)
-            tn.write(b"\n")
-            time.sleep(1)
-            command = f"ping {target_ip}\n".encode()
-            tn.write(command)
-            time.sleep(4)
-            output = tn.read_very_eager().decode(errors="ignore")
-            return "ttl=" in output.lower() or "icmp_seq=" in output.lower()
-    except Exception as e:
-        print(f"❌ Ошибка пинга с VPC ({port}): {e}")
-    return False
-
-
 def extract_ip_from_show_ip(output: str) -> str:
-    """
-    Парсит вывод show ip all и извлекает IP-адрес
-    """
     match = re.search(r"\bIP/MASK\s+GATEWAY.*\n.*?(\d+\.\d+\.\d+\.\d+)/\d+", output)
-    if match:
-        return match.group(1)
-    else:
-        raise ValueError("❌ Не удалось найти IP в выводе команды show ip all")
+    if not match:
+        raise ValueError("IP не найден в show ip all")
+    return match.group(1)
 
 def ping_test(host: str, port: int, targets: list[str]) -> dict:
-    """
-    Выполняет пинг с VPC-хоста до списка IP-адресов
-    Возвращает словарь с результатами по каждому IP
-    """
     results = {}
     try:
         with telnetlib.Telnet(host, port, timeout=5) as tn:
-            time.sleep(1)
-            tn.write(b"\n")
-            time.sleep(1)
-            tn.write(b"show ip all\n")
-            time.sleep(1)
+            tn.write(b"\n"); time.sleep(1)
+            tn.write(b"show ip all\n"); time.sleep(1)
             output = tn.read_very_eager().decode(errors="ignore")
-            print(f"🔎 Вывод show ip all:\n{output}")
             my_ip = extract_ip_from_show_ip(output)
-            print(f"🧠 Мой IP: {my_ip}")
+            print(f"🔎 IP {my_ip}")
 
-            for target_ip in targets:
-                tn.write(f"ping {target_ip}\n".encode())
-                time.sleep(5)
-                ping_output = tn.read_very_eager().decode(errors="ignore")
-                print(f"📡 Пинг {target_ip}:\n{ping_output}")
-                if ("unreachable" in ping_output.lower() or
-                    "timeout" in ping_output.lower()):
-                    results[target_ip] = False
-                else:
-                    results[target_ip] = True
+            for target in targets:
+                tn.write(f"ping {target}\n".encode())
+                time.sleep(4)
+                response = tn.read_very_eager().decode(errors="ignore")
+                results[target] = "unreachable" not in response.lower() and "timeout" not in response.lower()
     except Exception as e:
-        print(f"🚨 Ошибка при пинге с порта {port}: {e}")
-        for ip in targets:
-            results[ip] = False
+        print(f"⚠️ Ошибка пинга с порта {port}: {e}")
+        for t in targets:
+            results[t] = False
     return results
-
-
 
 
 if __name__ == '__main__':
