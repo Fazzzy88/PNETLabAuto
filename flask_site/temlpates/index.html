@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Выбор лабораторной</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+    <h1>Выберите лабораторную работу</h1>
+    <ul>
+        {% for lab in labs %}
+            <li><a href="{{ url_for('view_lab', lab_name=lab) }}">{{ lab }}</a></li>
+        {% endfor %}
+    </ul>
+</body>
+</html>

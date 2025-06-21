@@ -1,1 +1,57 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Проверка {{ lab }}</title>
+    <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<div class="container">
+    <div class="left-panel">
+        <h2>Студенты</h2>
+        <form id="student-form">
+            {% for student in students %}
+                <label>
+                    <input type="checkbox" name="student" value="{{ student }}">
+                    {{ student }}
+                </label><br>
+            {% endfor %}
+            <button type="button" onclick="runCheck(false)">Проверить выбранных</button>
+            <button type="button" onclick="runCheck(true)">Проверить всех</button>
+        </form>
+    </div>
+    <div class="right-panel">
+        <h2>Терминал</h2>
+        <pre id="terminal">Ожидание запуска...</pre>
+    </div>
+</div>
 
+<script>
+    function runCheck(runAll) {
+        const checkboxes = document.querySelectorAll('input[name="student"]:checked');
+        const students = Array.from(checkboxes).map(cb => cb.value);
+        const terminal = document.getElementById("terminal");
+        terminal.textContent = "⏳ Проверка запущена...\n";
+
+        fetch("/run_check", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                lab: "{{ lab }}",
+                students: students,
+                run_all: runAll
+            })
+        })
+        .then(response => response.json())
+        .then(data => {
+            for (const [student, result] of Object.entries(data)) {
+                terminal.textContent += `${student}: ${result}\n`;
+            }
+        })
+        .catch(err => {
+            terminal.textContent += `Ошибка: ${err}`;
+        });
+    }
+</script>
+</body>
+</html>
